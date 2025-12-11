@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
@@ -12,7 +11,6 @@ import (
 	"io"
 	"log"
 	"math/big"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,9 +20,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/xtls/xray-core/core"
-	_ "github.com/xtls/xray-core/main/distro/all"
 )
 
 // tlsConfig 全局 TLS 配置，跳过证书验证
@@ -77,14 +72,11 @@ const (
 	InstanceStatusStopped                       // 已停止
 )
 
-// XrayInstance xray 实例
-type XrayInstance struct {
-	server    *core.Instance
+// ProxyInstance 代理实例（使用 sing-box）
+type ProxyInstance struct {
 	localPort int
 	node      *ProxyNode
 	running   bool
-	ctx       context.Context
-	cancel    context.CancelFunc
 	status    InstanceStatus
 	lastUsed  time.Time
 	proxyURL  string
@@ -96,10 +88,8 @@ type ProxyManager struct {
 	mu             sync.RWMutex
 	nodes          []*ProxyNode
 	healthyNodes   []*ProxyNode
-	basePort       int
-	instances      map[int]*XrayInstance
-	instancePool   []*XrayInstance // 预启动的实例池
-	maxPoolSize    int             // 最大实例池大小
+	instancePool   []*ProxyInstance // 活跃实例追踪
+	maxPoolSize    int              // 最大实例池大小
 	subscribeURLs  []string
 	proxyFiles     []string
 	lastUpdate     time.Time
@@ -122,9 +112,7 @@ var (
 )
 
 var Manager = &ProxyManager{
-	basePort:       10800,
-	instances:      make(map[int]*XrayInstance),
-	instancePool:   make([]*XrayInstance, 0),
+	instancePool:   make([]*ProxyInstance, 0),
 	maxPoolSize:    5,
 	updateInterval: 30 * time.Minute,
 	checkInterval:  5 * time.Minute,
@@ -952,31 +940,11 @@ func parseDirectProxy(link string) *ProxyNode {
 	}
 }
 
-// startInstanceLocked 内部方法：启动实例（需要持有锁）
-func (pm *ProxyManager) startInstanceLocked(node *ProxyNode) (*XrayInstance, error) {
-	// sing-box 支持的协议（hysteria2/tuic 等）
-	if IsSingboxProtocol(node.Protocol) {
-		sm := GetSingboxManager()
-		if !sm.IsAvailable() {
-			return nil, fmt.Errorf("协议 %s 需要 sing-box，但 sing-box 不可用", node.Protocol)
-		}
-		proxyURL, err := sm.Start(node)
-		if err != nil {
-			return nil, fmt.Errorf("sing-box 启动失败: %w", err)
-		}
-		return &XrayInstance{
-			node:      node,
-			running:   true,
-			status:    InstanceStatusIdle,
-			proxyURL:  proxyURL,
-			lastUsed:  time.Now(),
-			localPort: node.LocalPort,
-		}, nil
-	}
-
-	// 直接代理不需要 xray
+// startInstanceLocked 内部方法：启动实例（使用 sing-box）
+func (pm *ProxyManager) startInstanceLocked(node *ProxyNode) (*ProxyInstance, error) {
+	// 直接代理不需要启动
 	if node.Protocol == "http" || node.Protocol == "https" || node.Protocol == "socks5" {
-		return &XrayInstance{
+		return &ProxyInstance{
 			node:     node,
 			running:  true,
 			status:   InstanceStatusIdle,
@@ -985,108 +953,20 @@ func (pm *ProxyManager) startInstanceLocked(node *ProxyNode) (*XrayInstance, err
 		}, nil
 	}
 
-	// 分配端口（带重试）
-	var localPort int
-	for retry := 0; retry < 3; retry++ {
-		localPort = pm.allocatePort()
-		if localPort != 0 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if localPort == 0 {
-		return nil, fmt.Errorf("无可用端口")
-	}
-
-	// 生成 xray 配置
-	xrayConfig := pm.buildXrayConfig(node, localPort)
-	if xrayConfig == nil {
-		// xray 配置生成失败，尝试 sing-box
-		if CanSingboxHandle(node.Protocol) {
-			log.Printf("⚠️ [%s] xray 配置失败，尝试 sing-box", node.Name)
-			proxyURL, err := TrySingboxStart(node)
-			if err == nil {
-				return &XrayInstance{
-					node:      node,
-					running:   true,
-					status:    InstanceStatusIdle,
-					proxyURL:  proxyURL,
-					lastUsed:  time.Now(),
-					localPort: node.LocalPort,
-				}, nil
-			}
-		}
-		return nil, fmt.Errorf("生成配置失败")
-	}
-
-	// 启动内置 xray
-	ctx, cancel := context.WithCancel(context.Background())
-	server, err := core.New(xrayConfig)
+	// 使用 sing-box 启动代理
+	proxyURL, err := singboxMgr.Start(node)
 	if err != nil {
-		cancel()
-		// xray 创建失败，尝试 sing-box
-		if CanSingboxHandle(node.Protocol) {
-			log.Printf("⚠️ [%s] xray 创建失败: %v，尝试 sing-box", node.Name, err)
-			proxyURL, sbErr := TrySingboxStart(node)
-			if sbErr == nil {
-				return &XrayInstance{
-					node:      node,
-					running:   true,
-					status:    InstanceStatusIdle,
-					proxyURL:  proxyURL,
-					lastUsed:  time.Now(),
-					localPort: node.LocalPort,
-				}, nil
-			}
-		}
-		return nil, fmt.Errorf("创建 xray 实例失败: %w", err)
+		return nil, fmt.Errorf("sing-box 启动失败: %w", err)
 	}
 
-	if err := server.Start(); err != nil {
-		cancel()
-		// xray 启动失败，尝试 sing-box
-		if CanSingboxHandle(node.Protocol) {
-			log.Printf("⚠️ [%s] xray 启动失败: %v，尝试 sing-box", node.Name, err)
-			proxyURL, sbErr := TrySingboxStart(node)
-			if sbErr == nil {
-				return &XrayInstance{
-					node:      node,
-					running:   true,
-					status:    InstanceStatusIdle,
-					proxyURL:  proxyURL,
-					lastUsed:  time.Now(),
-					localPort: node.LocalPort,
-				}, nil
-			}
-		}
-		return nil, fmt.Errorf("启动 xray 失败: %w", err)
-	}
-
-	// 等待端口可用并验证
-	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", localPort)
-	for i := 0; i < 10; i++ {
-		time.Sleep(50 * time.Millisecond)
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 100*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			break
-		}
-	}
-
-	instance := &XrayInstance{
-		server:    server,
-		localPort: localPort,
+	return &ProxyInstance{
 		node:      node,
 		running:   true,
-		ctx:       ctx,
-		cancel:    cancel,
 		status:    InstanceStatusIdle,
-		lastUsed:  time.Now(),
 		proxyURL:  proxyURL,
-	}
-	pm.instances[localPort] = instance
-	node.LocalPort = localPort
-	return instance, nil
+		lastUsed:  time.Now(),
+		localPort: node.LocalPort,
+	}, nil
 }
 
 func (pm *ProxyManager) StartXray(node *ProxyNode) (string, error) {
@@ -1099,307 +979,21 @@ func (pm *ProxyManager) StartXray(node *ProxyNode) (string, error) {
 	}
 	return instance.proxyURL, nil
 }
-func (pm *ProxyManager) buildXrayConfig(node *ProxyNode, localPort int) *core.Config {
-	jsonConfig := pm.generateXrayConfig(node, localPort)
 
-	config, err := core.LoadConfig("json", strings.NewReader(jsonConfig))
-	if err != nil {
-		log.Printf("⚠️ 解析配置失败: %v", err)
-		return nil
-	}
-	return config
-}
-func (pm *ProxyManager) allocatePort() int {
-	for port := pm.basePort; port < pm.basePort+1000; port++ {
-		if _, exists := pm.instances[port]; exists {
-			continue
-		}
-		if pm.isPortAvailable(port) {
-			return port
-		}
-	}
-	return 0
+// StopProxy 停止代理实例
+func (pm *ProxyManager) StopProxy(localPort int) {
+	singboxMgr.Stop(localPort)
 }
 
-// isPortAvailable 检查端口是否可用
-func (pm *ProxyManager) isPortAvailable(port int) bool {
-	// 尝试绑定 TCP
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		return false
-	}
-	ln.Close()
-	time.Sleep(10 * time.Millisecond)
-
-	ln2, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		return false
-	}
-	ln2.Close()
-	return true
-}
-
-// generateXrayConfig 生成 xray 配置
-func (pm *ProxyManager) generateXrayConfig(node *ProxyNode, localPort int) string {
-	var outbound string
-	// mux 多路复用配置
-	muxConfig := `"mux": {"enabled": true, "concurrency": 8}`
-
-	switch node.Protocol {
-	case "vmess":
-		outbound = fmt.Sprintf(`{
-			"protocol": "vmess",
-			"settings": {
-				"vnext": [{
-					"address": "%s",
-					"port": %d,
-					"users": [{
-						"id": "%s",
-						"alterId": %d,
-						"security": "%s"
-					}]
-				}]
-			},
-			"streamSettings": %s,
-			%s
-		}`, node.Server, node.Port, node.UUID, node.AlterId, node.Security, pm.generateStreamSettings(node), muxConfig)
-
-	case "vless":
-		// VLESS 支持 flow（XTLS）
-		flowStr := ""
-		if node.Flow != "" {
-			flowStr = fmt.Sprintf(`,"flow": "%s"`, node.Flow)
-		}
-		// 如果使用 flow，禁用 mux
-		muxStr := muxConfig
-		if node.Flow != "" {
-			muxStr = `"mux": {"enabled": false}`
-		}
-		outbound = fmt.Sprintf(`{
-			"protocol": "vless",
-			"settings": {
-				"vnext": [{
-					"address": "%s",
-					"port": %d,
-					"users": [{
-						"id": "%s",
-						"encryption": "none"%s
-					}]
-				}]
-			},
-			"streamSettings": %s,
-			%s
-		}`, node.Server, node.Port, node.UUID, flowStr, pm.generateStreamSettings(node), muxStr)
-
-	case "shadowsocks":
-		outbound = fmt.Sprintf(`{
-			"protocol": "shadowsocks",
-			"settings": {
-				"servers": [{
-					"address": "%s",
-					"port": %d,
-					"method": "%s",
-					"password": "%s"
-				}]
-			},
-			%s
-		}`, node.Server, node.Port, node.Method, node.Password, muxConfig)
-
-	case "trojan":
-		outbound = fmt.Sprintf(`{
-			"protocol": "trojan",
-			"settings": {
-				"servers": [{
-					"address": "%s",
-					"port": %d,
-					"password": "%s"
-				}]
-			},
-			"streamSettings": %s,
-			%s
-		}`, node.Server, node.Port, node.Password, pm.generateStreamSettings(node), muxConfig)
-	}
-	return fmt.Sprintf(`{
-		"log": {
-			"access": "none",
-			"error": "none",
-			"loglevel": "none",
-			"dnsLog": false
-		},
-		"inbounds": [{
-			"port": %d,
-			"listen": "127.0.0.1",
-			"protocol": "http",
-			"settings": {}
-		}],
-		"outbounds": [%s]
-	}`, localPort, outbound)
-}
-
-// generateStreamSettings 生成传输设置
-func (pm *ProxyManager) generateStreamSettings(node *ProxyNode) string {
-	network := node.Network
-	if network == "" {
-		network = "tcp"
-	}
-
-	var settings string
-	switch network {
-	case "ws":
-		host := node.Host
-		if host == "" {
-			host = node.Server
-		}
-		// 使用新格式：独立的 host 字段，避免 deprecated 警告
-		settings = fmt.Sprintf(`"wsSettings": {"path": "%s", "host": "%s"}`, node.Path, host)
-
-	case "grpc":
-		settings = fmt.Sprintf(`"grpcSettings": {"serviceName": "%s", "multiMode": true}`, node.Path)
-
-	case "kcp", "mkcp":
-		headerType := "none"
-		if node.Type != "" {
-			headerType = node.Type
-		}
-		settings = fmt.Sprintf(`"kcpSettings": {
-			"mtu": 1350, "tti": 50, "uplinkCapacity": 12, "downlinkCapacity": 100,
-			"congestion": false, "readBufferSize": 2, "writeBufferSize": 2,
-			"header": {"type": "%s"}
-		}`, headerType)
-
-	case "quic":
-		headerType := "none"
-		if node.Type != "" {
-			headerType = node.Type
-		}
-		settings = fmt.Sprintf(`"quicSettings": {"security": "none", "key": "", "header": {"type": "%s"}}`, headerType)
-
-	case "httpupgrade":
-		host := node.Host
-		if host == "" {
-			host = node.Server
-		}
-		path := node.Path
-		if path == "" {
-			path = "/"
-		}
-		settings = fmt.Sprintf(`"httpupgradeSettings": {"path": "%s", "host": "%s"}`, path, host)
-
-	case "splithttp", "xhttp":
-		host := node.Host
-		if host == "" {
-			host = node.Server
-		}
-		path := node.Path
-		if path == "" {
-			path = "/"
-		}
-		settings = fmt.Sprintf(`"splithttpSettings": {"path": "%s", "host": "%s"}`, path, host)
-
-	case "h2", "http":
-		host := node.Host
-		if host == "" {
-			host = node.Server
-		}
-		path := node.Path
-		if path == "" {
-			path = "/"
-		}
-		settings = fmt.Sprintf(`"httpSettings": {"path": "%s", "host": ["%s"]}`, path, host)
-
-	default:
-		settings = ""
-	}
-
-	// 安全设置
-	security := "none"
-	securitySettings := ""
-
-	if node.Security == "reality" {
-		// Reality 配置
-		security = "reality"
-		fp := node.Fingerprint
-		if fp == "" {
-			fp = "chrome"
-		}
-		sni := node.SNI
-		if sni == "" {
-			sni = node.Server
-		}
-		securitySettings = fmt.Sprintf(`, "realitySettings": {
-			"serverName": "%s",
-			"fingerprint": "%s",
-			"publicKey": "%s",
-			"shortId": "%s",
-			"spiderX": "%s"
-		}`, sni, fp, node.PublicKey, node.ShortId, node.SpiderX)
-	} else if node.TLS {
-		// TLS 配置
-		security = "tls"
-		sni := node.SNI
-		if sni == "" {
-			sni = node.Server
-		}
-		fp := node.Fingerprint
-		alpn := node.ALPN
-
-		tlsConfig := fmt.Sprintf(`"serverName": "%s", "allowInsecure": true`, sni)
-		if fp != "" {
-			tlsConfig += fmt.Sprintf(`, "fingerprint": "%s"`, fp)
-		}
-		if alpn != "" {
-			// 解析 ALPN（可能是逗号分隔）
-			alpnList := strings.Split(alpn, ",")
-			alpnJSON := ""
-			for i, a := range alpnList {
-				if i > 0 {
-					alpnJSON += ","
-				}
-				alpnJSON += fmt.Sprintf(`"%s"`, strings.TrimSpace(a))
-			}
-			tlsConfig += fmt.Sprintf(`, "alpn": [%s]`, alpnJSON)
-		}
-		securitySettings = fmt.Sprintf(`, "tlsSettings": {%s}`, tlsConfig)
-	}
-
-	if settings != "" {
-		return fmt.Sprintf(`{"network": "%s", "security": "%s", %s%s}`, network, security, settings, securitySettings)
-	}
-	return fmt.Sprintf(`{"network": "%s", "security": "%s"%s}`, network, security, securitySettings)
-}
-
-// StopXray 停止 xray 实例
+// StopXray 停止代理实例（兼容旧接口）
 func (pm *ProxyManager) StopXray(localPort int) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	if instance, ok := pm.instances[localPort]; ok {
-		if instance.server != nil {
-			instance.server.Close()
-		}
-		if instance.cancel != nil {
-			instance.cancel()
-		}
-		instance.running = false
-		delete(pm.instances, localPort)
-	}
+	pm.StopProxy(localPort)
 }
 
 // StopAll 停止所有实例
 func (pm *ProxyManager) StopAll() {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	for port, instance := range pm.instances {
-		if instance.server != nil {
-			instance.server.Close()
-		}
-		if instance.cancel != nil {
-			instance.cancel()
-		}
-		delete(pm.instances, port)
-	}
-	log.Printf("🛑 所有 xray 实例已停止")
+	singboxMgr.StopAll()
+	log.Printf("🛑 所有代理实例已停止")
 }
 
 // CheckHealth 检查节点健康并获取出口IP
@@ -1442,11 +1036,11 @@ func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
 	node.Latency = time.Since(start)
 	ipClient := &http.Client{
 		Transport: transport,
-		Timeout:   3 * time.Second, 
+		Timeout:   3 * time.Second,
 	}
 	ipResp, err := ipClient.Get("https://ipinfo.io/ip")
 	if err != nil {
-		return true 
+		return true
 	}
 	defer ipResp.Body.Close()
 
@@ -1667,7 +1261,7 @@ func (pm *ProxyManager) CheckAllHealth() {
 }
 
 // GetFromPool 从实例池获取一个空闲实例
-func (pm *ProxyManager) GetFromPool() *XrayInstance {
+func (pm *ProxyManager) GetFromPool() *ProxyInstance {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -1686,7 +1280,7 @@ func (pm *ProxyManager) GetFromPool() *XrayInstance {
 }
 
 // ReturnToPool 归还实例到池
-func (pm *ProxyManager) ReturnToPool(inst *XrayInstance) {
+func (pm *ProxyManager) ReturnToPool(inst *ProxyInstance) {
 	if inst == nil {
 		return
 	}
@@ -1695,109 +1289,143 @@ func (pm *ProxyManager) ReturnToPool(inst *XrayInstance) {
 	inst.mu.Unlock()
 }
 
-// ReleaseByURL 通过proxyURL释放实例
+// ReleaseByURL 通过proxyURL停止并释放实例
 func (pm *ProxyManager) ReleaseByURL(proxyURL string) {
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	for _, inst := range pm.instancePool {
+	// 查找并移除实例
+	var toStop *ProxyInstance
+	for i, inst := range pm.instancePool {
 		inst.mu.Lock()
-		if inst.proxyURL == proxyURL && inst.status == InstanceStatusInUse {
-			inst.status = InstanceStatusIdle
+		if inst.proxyURL == proxyURL {
+			toStop = inst
+			// 从池中移除
+			pm.instancePool = append(pm.instancePool[:i], pm.instancePool[i+1:]...)
 			inst.mu.Unlock()
-			return
+			break
 		}
 		inst.mu.Unlock()
+	}
+	pm.mu.Unlock()
+
+	// 停止实例（在锁外执行）
+	if toStop != nil {
+		pm.StopXray(toStop.localPort)
 	}
 }
 
 func (pm *ProxyManager) Next() string {
-	// 首先尝试从池中获取
-	if inst := pm.GetFromPool(); inst != nil {
-		return inst.proxyURL
-	}
-
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	nodes := pm.healthyNodes
-	if len(nodes) == 0 {
-		nodes = pm.nodes
-	}
-	if len(nodes) == 0 {
+	if len(pm.healthyNodes) == 0 && len(pm.nodes) == 0 {
 		return ""
 	}
 
 	now := time.Now()
+	var selectedNode *ProxyNode
+	var selectedIdx int = -1
 
-	// 筛选可用节点（不在冷却中且失败次数不超限）
-	var availableNodes []*ProxyNode
-	var cooldownNodes []*ProxyNode
-	for _, node := range nodes {
+	// 从健康节点列表中找第一个可用的
+	for i, node := range pm.healthyNodes {
 		// 检查冷却时间
 		cooldown := node.UseCooldown
 		if cooldown == 0 {
 			cooldown = DefaultProxyUseCooldown
 		}
 		if now.Sub(node.LastUsed) < cooldown {
-			cooldownNodes = append(cooldownNodes, node)
 			continue
 		}
-		// 失败次数过多的节点也加入备选，但优先级低
-		if node.FailCount < MaxProxyFailCount {
-			availableNodes = append(availableNodes, node)
-		} else {
-			cooldownNodes = append(cooldownNodes, node)
+		// 跳过失败次数过多的节点
+		if node.FailCount >= MaxProxyFailCount {
+			continue
+		}
+		selectedNode = node
+		selectedIdx = i
+		break
+	}
+
+	// 如果健康节点都不可用，尝试普通节点
+	if selectedNode == nil {
+		for i, node := range pm.nodes {
+			cooldown := node.UseCooldown
+			if cooldown == 0 {
+				cooldown = DefaultProxyUseCooldown
+			}
+			if now.Sub(node.LastUsed) < cooldown {
+				continue
+			}
+			if node.FailCount >= MaxProxyFailCount {
+				continue
+			}
+			selectedNode = node
+			selectedIdx = i
+			break
 		}
 	}
 
-	// 如果没有可用节点，使用冷却中最久未用的
-	if len(availableNodes) == 0 {
-		if len(cooldownNodes) == 0 {
-			return ""
-		}
-		// 找最久未用的
-		oldest := cooldownNodes[0]
-		for _, n := range cooldownNodes[1:] {
-			if n.LastUsed.Before(oldest.LastUsed) {
-				oldest = n
+	// 如果所有节点都在冷却中，选择最久未用的健康节点
+	if selectedNode == nil {
+		var oldest *ProxyNode
+		var oldestIdx int
+		for i, node := range pm.healthyNodes {
+			if oldest == nil || node.LastUsed.Before(oldest.LastUsed) {
+				oldest = node
+				oldestIdx = i
 			}
 		}
-		availableNodes = []*ProxyNode{oldest}
+		if oldest == nil {
+			for i, node := range pm.nodes {
+				if oldest == nil || node.LastUsed.Before(oldest.LastUsed) {
+					oldest = node
+					oldestIdx = i
+				}
+			}
+		}
+		if oldest == nil {
+			return ""
+		}
+		selectedNode = oldest
+		selectedIdx = oldestIdx
 	}
 
-	// 随机选择：从前30%低延迟节点中随机选择，避免总是用同一个
-	topCount := len(availableNodes) * 30 / 100
-	if topCount < 3 {
-		topCount = len(availableNodes)
-		if topCount > 3 {
-			topCount = 3
+	selectedNode.LastUsed = now
+	isFromHealthy := false
+	for i, node := range pm.healthyNodes {
+		if node == selectedNode {
+			isFromHealthy = true
+			selectedIdx = i
+			break
 		}
 	}
-	if topCount > len(availableNodes) {
-		topCount = len(availableNodes)
+
+	if isFromHealthy && selectedIdx >= 0 && selectedIdx < len(pm.healthyNodes) {
+		// 从健康节点列表移动到末尾
+		pm.healthyNodes = append(pm.healthyNodes[:selectedIdx], pm.healthyNodes[selectedIdx+1:]...)
+		pm.healthyNodes = append(pm.healthyNodes, selectedNode)
+	} else if !isFromHealthy {
+		// 从普通节点列表移动到末尾
+		for i, node := range pm.nodes {
+			if node == selectedNode {
+				pm.nodes = append(pm.nodes[:i], pm.nodes[i+1:]...)
+				pm.nodes = append(pm.nodes, selectedNode)
+				break
+			}
+		}
 	}
 
-	// 随机选一个
-	randIdx, _ := rand.Int(rand.Reader, big.NewInt(int64(topCount)))
-	node := availableNodes[randIdx.Int64()]
-	node.LastUsed = now
-
 	// 启动新实例
-	instance, err := pm.startInstanceLocked(node)
+	instance, err := pm.startInstanceLocked(selectedNode)
 	if err != nil {
 		log.Printf("⚠️ 启动代理失败: %v", err)
-		node.FailCount++
+		selectedNode.FailCount++
 		// 失败后增加冷却时间
-		node.UseCooldown = time.Duration(node.FailCount) * 10 * time.Second
+		selectedNode.UseCooldown = time.Duration(selectedNode.FailCount) * 10 * time.Second
 		return ""
 	}
 	instance.status = InstanceStatusInUse
 
-	// 控制池大小
-	if len(pm.instancePool) < pm.maxPoolSize {
-		pm.instancePool = append(pm.instancePool, instance)
-	}
+	// 始终追踪实例（用于 MarkProxyFailed/ReleaseByURL）
+	pm.instancePool = append(pm.instancePool, instance)
 	return instance.proxyURL
 }
 
@@ -2153,7 +1781,6 @@ func (as *AutoSubscriber) Start(pm *ProxyManager) {
 				return
 			case <-ticker.C:
 				if err := as.refreshSubscription(); err != nil {
-					log.Printf("❌ [自动订阅] 刷新失败: %v", err)
 				}
 			}
 		}

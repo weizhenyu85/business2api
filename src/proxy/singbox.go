@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -15,9 +15,13 @@ import (
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
+
+	// 启用 QUIC 协议支持（hysteria, hysteria2, tuic）
+	_ "github.com/sagernet/sing-quic/hysteria"
+	_ "github.com/sagernet/sing-quic/hysteria2"
+	_ "github.com/sagernet/sing-quic/tuic"
 )
 
-// SingboxManager sing-box 内置 core 管理器
 type SingboxManager struct {
 	mu        sync.Mutex
 	instances map[int]*SingboxInstance
@@ -42,36 +46,20 @@ var singboxMgr = &SingboxManager{
 	ready:     true,
 }
 
-// NeedsQUIC 检查协议是否需要 QUIC 支持（当前构建不支持）
-func NeedsQUIC(protocol string) bool {
-	switch protocol {
-	case "hysteria", "hysteria2", "hy2", "tuic":
-		return true
-	}
-	return false
-}
-
+// IsSingboxProtocol 所有协议都由 sing-box 处理
 func IsSingboxProtocol(protocol string) bool {
 	switch protocol {
-	case "anytls": 
+	case "vmess", "vless", "shadowsocks", "trojan", "socks", "http",
+		"hysteria", "hysteria2", "hy2", "tuic", "wireguard", "anytls":
 		return true
 	}
 	return false
 }
 
 func CanSingboxHandle(protocol string) bool {
-	if NeedsQUIC(protocol) {
-		return false
-	}
-	switch protocol {
-	case "vmess", "vless", "shadowsocks", "trojan", "socks", "http",
-		"wireguard", "anytls":
-		return true
-	}
-	return false
+	return IsSingboxProtocol(protocol)
 }
 
-// IsAvailable 检查 sing-box 是否可用
 func (sm *SingboxManager) IsAvailable() bool {
 	return sm.ready
 }
@@ -85,18 +73,10 @@ func (sm *SingboxManager) Start(node *ProxyNode) (string, error) {
 	if port == 0 {
 		return "", fmt.Errorf("无可用端口")
 	}
-
-	// 生成 JSON 配置
 	configJSON := sm.generateConfigJSON(node, port)
-
-	// 创建并启动 sing-box 实例
 	ctx, cancel := context.WithCancel(context.Background())
-
-	// 使用 include 包注册所有协议并创建带有 registry 的 context
 	ctx = box.Context(ctx, include.InboundRegistry(), include.OutboundRegistry(),
 		include.EndpointRegistry(), include.DNSTransportRegistry(), include.ServiceRegistry())
-
-	// 解析配置
 	var opts option.Options
 	err := opts.UnmarshalJSONContext(ctx, []byte(configJSON))
 	if err != nil {
@@ -120,13 +100,39 @@ func (sm *SingboxManager) Start(node *ProxyNode) (string, error) {
 
 	// 等待端口就绪
 	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	portReady := false
 	for i := 0; i < 20; i++ {
 		time.Sleep(50 * time.Millisecond)
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
 		if err == nil {
 			conn.Close()
+			portReady = true
 			break
 		}
+	}
+	if !portReady {
+		singBox.Close()
+		cancel()
+		return "", fmt.Errorf("端口 %d 未就绪", port)
+	}
+	proxyURLParsed, _ := url.Parse(proxyURL)
+	testClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURLParsed),
+		},
+		Timeout: 5 * time.Second,
+	}
+	testResp, testErr := testClient.Get("https://www.gstatic.com/generate_204")
+	if testErr != nil {
+		singBox.Close()
+		cancel()
+		return "", fmt.Errorf("代理连通性测试失败: %w", testErr)
+	}
+	testResp.Body.Close()
+	if testResp.StatusCode != 204 && testResp.StatusCode != 200 {
+		singBox.Close()
+		cancel()
+		return "", fmt.Errorf("代理连通性测试失败: 状态码 %d", testResp.StatusCode)
 	}
 
 	instance := &SingboxInstance{
@@ -175,10 +181,8 @@ func (sm *SingboxManager) StopAll() {
 		}
 		delete(sm.instances, port)
 	}
-	log.Printf("🛑 所有 sing-box 实例已停止")
 }
 
-// findAvailablePort 查找可用端口
 func (sm *SingboxManager) findAvailablePort() int {
 	for port := sm.basePort; port < sm.basePort+1000; port++ {
 		if _, exists := sm.instances[port]; !exists {

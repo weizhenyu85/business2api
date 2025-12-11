@@ -60,6 +60,7 @@ jobs:
             EXT=".exe"
           fi
           CGO_ENABLED=0 go build \
+            -tags "with_quic,with_utls" \
             -ldflags="-s -w -X main.Version=${VERSION}" \
             -o business2api-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} .
 

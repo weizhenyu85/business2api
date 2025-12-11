@@ -16,7 +16,7 @@ COPY *.go ./
 COPY src/ ./src/
 
 # Build binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o business2api .
+RUN CGO_ENABLED=0 GOOS=linux go build -tags "with_quic,with_utls" -ldflags="-s -w" -o business2api .
 
 # Runtime stage
 FROM alpine:latest
